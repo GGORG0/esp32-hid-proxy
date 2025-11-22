@@ -20,6 +20,9 @@ static NimBLEUUID MANUFACTURER_NAME_UUID((uint16_t)0x2A29);
 // Scan duration in milliseconds
 #define SCAN_DURATION 2000
 
+// Device name to advertise
+#define DEVICE_NAME "ESP_HID_Proxy"
+
 // Connected device handle
 static NimBLEClient *pClient = nullptr;
 static bool deviceConnected = false;
@@ -82,6 +85,7 @@ struct HIDReportInfo
 void connectToDevice();
 void subscribeToReports(NimBLEClient *client);
 HIDReportInfo parseReportMap(const uint8_t *data, size_t len);
+void startAdvertising();
 
 void clearDisplay()
 {
@@ -167,6 +171,8 @@ class ClientCallbacks : public NimBLEClientCallbacks
     tft.setTextColor(TFT_WHITE);
 
     deviceConnected = true;
+
+    NimBLEDevice::stopAdvertising();
   }
 
   void onDisconnect(NimBLEClient *pClient, int reason) override
@@ -192,7 +198,6 @@ class ClientCallbacks : public NimBLEClientCallbacks
   {
     Serial.printf("Confirm passkey: %06u - accepting\n", passkey);
 
-    clearDisplay();
     tft.setTextColor(TFT_MAGENTA);
     tft.printf("Passkey: %06u\n", passkey);
     tft.setTextColor(TFT_WHITE);
@@ -533,6 +538,8 @@ void connectToDevice()
 
 void startScan()
 {
+  startAdvertising();
+
   Serial.println("\n=== Starting BLE Scan ===");
 
   clearDisplay();
@@ -554,6 +561,18 @@ void startScan()
   pScan->setWindow(48);
   pScan->setDuplicateFilter(true);
   pScan->start(SCAN_DURATION);
+}
+
+void startAdvertising()
+{
+  NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+  if (pAdvertising->isAdvertising())
+    return;
+  pAdvertising->setConnectableMode(BLE_GAP_CONN_MODE_UND);
+  pAdvertising->setDiscoverableMode(BLE_GAP_DISC_MODE_GEN);
+  pAdvertising->setName(DEVICE_NAME);
+  pAdvertising->start();
+  Serial.println("Started advertising");
 }
 
 void setup()
@@ -578,7 +597,7 @@ void setup()
   Serial.println("BLE HID Proxy");
 
   // Initialize NimBLE
-  NimBLEDevice::init("ESP_HID_Proxy");
+  NimBLEDevice::init(DEVICE_NAME);
 
   // Set security parameters
   NimBLEDevice::setSecurityAuth(true, true, true); // bonding, MITM, SC
@@ -588,6 +607,10 @@ void setup()
 
   // Set MTU
   NimBLEDevice::setMTU(517);
+
+  // Create a server to allow for reverse connections
+  NimBLEServer *pServer = NimBLEDevice::createServer();
+  pServer->start();
 
   Serial.printf("Device Address: %s\n", NimBLEDevice::getAddress().toString().c_str());
 
