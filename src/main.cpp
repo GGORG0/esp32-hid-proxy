@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <TFT_eSPI.h>
+#include "USB.h"
+#include "USBHID.h"
 
 // HID Service and Characteristic UUIDs
 static NimBLEUUID HID_SERVICE_UUID((uint16_t)0x1812);
@@ -27,9 +29,59 @@ static NimBLEAdvertisedDevice *advDevice = nullptr;
 // TFT Display
 TFT_eSPI tft = TFT_eSPI();
 
+// Custom USB HID device to use dynamic report descriptor
+class ProxyHIDDevice : public USBHIDDevice
+{
+public:
+  ProxyHIDDevice()
+  {
+    _descriptor = nullptr;
+    _descriptorSize = 0;
+  }
+
+  void setDescriptor(const uint8_t *desc, uint16_t len)
+  {
+    _descriptor = desc;
+    _descriptorSize = len;
+  }
+
+  uint16_t _onGetDescriptor(uint8_t *buffer) override
+  {
+    if (_descriptor && _descriptorSize > 0)
+    {
+      memcpy(buffer, _descriptor, _descriptorSize);
+      return _descriptorSize;
+    }
+    return 0;
+  }
+
+private:
+  const uint8_t *_descriptor;
+  uint16_t _descriptorSize;
+};
+
+// USB HID
+USBHID HID;
+ProxyHIDDevice proxyDevice;
+static uint8_t *reportMapData = nullptr;
+static size_t reportMapSize = 0;
+static bool usbReady = false;
+
+// HID report parsing
+struct HIDReportInfo
+{
+  bool hasKeyboard = false;
+  bool hasMouse = false;
+  bool hasConsumer = false;
+  uint8_t keyboardReportId = 0;
+  uint8_t mouseReportId = 0;
+  uint8_t consumerReportId = 0;
+};
+
 // Forward declarations
 void connectToDevice();
 void subscribeToReports(NimBLEClient *client);
+HIDReportInfo parseReportMap(const uint8_t *data, size_t len);
 
 void clearDisplay()
 {
@@ -44,10 +96,51 @@ void notifyCallback(NimBLERemoteCharacteristic *pChar, uint8_t *pData, size_t le
                 pClient ? pClient->getPeerAddress().toString().c_str() : "??:??:??:??:??:??",
                 isNotify ? "INPUT" : "INDICATE", length);
   for (size_t i = 0; i < length; i++)
-  {
     Serial.printf("%02X ", pData[i]);
-  }
   Serial.println();
+
+  // Forward the raw report to USB HID
+  if (usbReady && length > 0)
+  {
+    uint8_t reportId = 0;
+    const uint8_t *reportData = pData;
+    size_t reportLen = length;
+
+    // Heuristic detection based on common report formats:
+    // Keyboard: 8 bytes (modifier, reserved, key1-6)
+    // Mouse: 3-5 bytes (buttons, x, y, [wheel], [pan])
+    if (length == 8)
+    {
+      reportId = HID_REPORT_ID_KEYBOARD;
+      Serial.println("Detected as keyboard report");
+    }
+    else if (length >= 3 && length <= 5)
+    {
+      reportId = HID_REPORT_ID_MOUSE;
+      Serial.println("Detected as mouse report");
+    }
+    else if (length == 2)
+    {
+      reportId = HID_REPORT_ID_CONSUMER_CONTROL;
+      Serial.println("Detected as consumer control report");
+    }
+    else
+    {
+      // Unknown report type, check if first byte is a report ID
+      if (pData[0] > 0 && pData[0] <= 7)
+      {
+        reportId = pData[0];
+        reportData = pData + 1;
+        reportLen = length - 1;
+        Serial.printf("Using embedded report ID: %d\n", reportId);
+      }
+      else
+        Serial.println("WARNING: Unknown report format, sending as report ID 0");
+    }
+
+    bool success = HID.SendReport(reportId, reportData, reportLen);
+    Serial.printf("SendReport(id=%d, len=%d) -> %s\n", reportId, reportLen, success ? "OK" : "FAILED");
+  }
 }
 
 // Battery level notification callback
@@ -70,7 +163,7 @@ class ClientCallbacks : public NimBLEClientCallbacks
     clearDisplay();
     tft.setTextColor(TFT_GREEN);
     tft.printf("CONNECTED to %s\n",
-                pClient->getPeerAddress().toString().c_str());
+               pClient->getPeerAddress().toString().c_str());
     tft.setTextColor(TFT_WHITE);
 
     deviceConnected = true;
@@ -110,13 +203,9 @@ class ClientCallbacks : public NimBLEClientCallbacks
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override
   {
     if (connInfo.isEncrypted())
-    {
       Serial.println("Authentication SUCCESS - connection encrypted");
-    }
     else
-    {
       Serial.println("Authentication FAILED");
-    }
   }
 
   void onIdentity(NimBLEConnInfo &connInfo) override
@@ -234,9 +323,7 @@ void printDeviceInfo(NimBLEClient *client)
       tft.printf("BATT: %d%%\n", level);
 
       if (battChar->canNotify())
-      {
         battChar->subscribe(true, batteryNotifyCallback);
-      }
     }
   }
 
@@ -262,6 +349,25 @@ void printDeviceInfo(NimBLEClient *client)
     {
       NimBLEAttValue val = reportMapChar->readValue();
       Serial.printf("Report Map Length: %d bytes\n", val.size());
+
+      // Store the report map for USB HID
+      if (reportMapData)
+        delete[] reportMapData;
+
+      reportMapSize = val.size();
+      reportMapData = new uint8_t[reportMapSize];
+      memcpy(reportMapData, val.data(), reportMapSize);
+
+      // Print the report map in hex for debugging
+      Serial.println("Report Map (hex):");
+      for (size_t i = 0; i < reportMapSize; i++)
+      {
+        Serial.printf("%02X ", reportMapData[i]);
+        if ((i + 1) % 16 == 0)
+          Serial.println();
+      }
+      if (reportMapSize % 16 != 0)
+        Serial.println();
     }
   }
   Serial.println("=========================================\n");
@@ -297,6 +403,44 @@ void subscribeToReports(NimBLEClient *client)
   }
 
   Serial.printf("Subscribed to %d HID Report(s)\n", reportCount);
+}
+
+// Simple HID report map parser (basic implementation)
+HIDReportInfo parseReportMap(const uint8_t *data, size_t len)
+{
+  HIDReportInfo info;
+
+  // Basic detection based on usage pages
+  // Usage Page 0x01 = Generic Desktop (mouse, keyboard)
+  // Usage Page 0x0C = Consumer devices
+  for (size_t i = 0; i < len - 1; i++)
+  {
+    // Look for Usage Page markers
+    if (data[i] == 0x05)
+    {
+      // Usage Page
+      uint8_t page = data[i + 1];
+      if (page == 0x01)
+      {
+        // Check for keyboard (Usage 0x06) or mouse (Usage 0x02)
+        for (size_t j = i; j < len - 1 && j < i + 20; j++)
+        {
+          if (data[j] == 0x09)
+          {
+            // Usage
+            if (data[j + 1] == 0x06)
+              info.hasKeyboard = true;
+            else if (data[j + 1] == 0x02)
+              info.hasMouse = true;
+          }
+        }
+      }
+      else if (page == 0x0C)
+        info.hasConsumer = true;
+    }
+  }
+
+  return info;
 }
 
 void connectToDevice()
@@ -345,6 +489,41 @@ void connectToDevice()
   // Print device information
   printDeviceInfo(pClient);
 
+  // Initialize USB HID with the report descriptor from the BLE device
+  if (reportMapData && reportMapSize > 0)
+  {
+    Serial.println("Initializing USB HID with device report map...");
+
+    proxyDevice.setDescriptor(reportMapData, reportMapSize);
+
+    bool deviceAdded = USBHID::addDevice(&proxyDevice, reportMapSize);
+    Serial.printf("addDevice returned: %d\n", deviceAdded);
+
+    HID.begin();
+    Serial.println("HID.begin() called");
+
+    USB.begin();
+    Serial.println("USB.begin() called");
+
+    // Give USB time to enumerate
+    delay(1000);
+
+    bool hidReady = HID.ready();
+    Serial.printf("HID.ready() = %d\n", hidReady);
+
+    usbReady = true;
+
+    Serial.println("USB HID initialized!");
+
+    tft.setTextColor(TFT_GREEN);
+    tft.println("USB HID READY");
+    tft.setTextColor(TFT_WHITE);
+  }
+  else
+  {
+    Serial.println("ERROR: No report map data available!");
+  }
+
   // Subscribe to HID reports
   subscribeToReports(pClient);
 
@@ -384,7 +563,6 @@ void setup()
 
   Serial.println("--- BOOT START ---");
 
-  // Initialize TFT display
   tft.begin();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
