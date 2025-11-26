@@ -578,8 +578,6 @@ void startAdvertising()
 void setup()
 {
   Serial.begin(115200);
-  delay(3000);
-
   Serial.println("--- BOOT START ---");
 
   tft.begin();
